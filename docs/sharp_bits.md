@@ -98,12 +98,29 @@ parameters during optimisation. Each constrained parameter — [`PositiveReal`](
 Equinox-compatible pytree node whose `unwrap()` method applies the constraining
 bijection (e.g. softplus for positivity, sigmoid for bounded parameters).
 
-During optimisation, [`fit`](#gpjax.fit.fit) calls
-[`paramax.unwrap`](inv:paramax#paramax.wrappers.unwrap) inside the loss function.
-This recursively resolves every `AbstractUnwrappable` leaf in the model tree, mapping
-internal unconstrained values to their constrained counterparts. Gradients are computed
-in the unconstrained space, and updates are applied directly to the unconstrained
-arrays — no explicit forward/inverse transform step is needed.
+During optimisation, [`fit`](#gpjax.fit.fit) passes the model to your objective with
+its parameters still wrapped, and each parameter is resolved where it is read, via
+[`gpjax.parameters.value`](#gpjax.parameters.value). That applies the constraining
+bijection, mapping the internal unconstrained value to its constrained counterpart.
+Gradients are computed in the unconstrained space, and updates are applied directly
+to the unconstrained arrays — no explicit forward/inverse transform step is needed.
+
+This matters when you write your own objective: read parameters with `value`, not
+by indexing the pytree.
+
+```py
+from gpjax.parameters import value
+
+def my_objective(model, data):
+    lengthscale = value(model.prior.kernel.lengthscale)
+    ...
+```
+
+Parameters are left wrapped so that objectives can reach the metadata attached to
+them — this is how [`with_log_prior`](#gpjax.objectives.with_log_prior)
+finds the prior on each parameter. Reaching a parameter through a generic pytree
+traversal (`jax.tree.map` and friends) yields the *unconstrained* value instead,
+silently; go through `value`.
 
 To freeze parameters so they are not updated during optimisation, wrap them with
 [`paramax.non_trainable`](inv:paramax#paramax.wrappers.non_trainable). This excludes the

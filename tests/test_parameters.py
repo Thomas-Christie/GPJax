@@ -176,3 +176,95 @@ def test_coregionalization_matrix():
     # PSD check: all eigenvalues >= 0
     eigvals = jnp.linalg.eigvalsh(B)
     assert jnp.all(eigvals >= -1e-6)
+
+
+def test_value_resolves_parameters_and_passes_arrays_through():
+    from gpjax.parameters import PositiveReal, value
+
+    p = PositiveReal(jnp.array(2.0))
+    assert jnp.allclose(value(p), jnp.array(2.0), atol=1e-5)
+
+    raw = jnp.array(3.0)
+    assert value(raw) is raw
+
+
+def test_value_preserves_the_gradient_block_on_frozen_parameters():
+    """`value` must resolve through a `non_trainable` wrapper, keeping both the
+    constrained value and the stop-gradient."""
+    from gpjax.parameters import PositiveReal, value
+    import jax
+
+    frozen = paramax.non_trainable(PositiveReal(jnp.array(2.0)))
+    assert jnp.allclose(value(frozen), jnp.array(2.0), atol=1e-5)
+
+    grad = jax.grad(lambda p: value(p) ** 2)(frozen)
+    assert all(jnp.allclose(leaf, 0.0) for leaf in jax.tree_util.tree_leaves(grad))
+
+
+def test_parameter_prior_defaults_to_none():
+    from gpjax.parameters import (
+        LowerTriangular,
+        NonNegativeReal,
+        PositiveReal,
+        Real,
+        SigmoidBounded,
+    )
+
+    assert PositiveReal(jnp.array(1.0)).prior is None
+    assert NonNegativeReal(jnp.array(1.0)).prior is None
+    assert Real(jnp.array(1.0)).prior is None
+    assert SigmoidBounded(jnp.array(0.5)).prior is None
+    assert LowerTriangular(jnp.eye(2)).prior is None
+
+
+def test_parameter_prior_is_static_and_not_optimised():
+    """A numpyro distribution is itself a pytree of arrays. The prior must be a
+    static field, or `eqx.partition(model, eqx.is_array)` would sweep the
+    prior's own hyperparameters into the trainable partition."""
+    import equinox as eqx
+    from gpjax.parameters import PositiveReal
+    import jax
+    import numpyro.distributions as dist
+
+    p = PositiveReal(jnp.array(1.0), prior=dist.LogNormal(jnp.log(3.0), 0.15))
+    params, static = eqx.partition(p, eqx.is_array)
+
+    # Only the parameter's own unconstrained value is trainable.
+    assert len(jax.tree_util.tree_leaves(params)) == 1
+    assert eqx.combine(params, static).prior is p.prior
+
+
+def test_collect_log_prior_sums_priors_and_skips_unpriored_parameters():
+    from gpjax.parameters import PositiveReal, Real, collect_log_prior
+    import numpyro.distributions as dist
+
+    ls_prior = dist.LogNormal(jnp.log(2.0), 0.5)
+    mean_prior = dist.Normal(0.0, 1.0)
+    tree = {
+        "a": PositiveReal(jnp.array(0.7), prior=ls_prior),
+        "b": Real(jnp.array(0.4), prior=mean_prior),
+        "c": PositiveReal(jnp.array(1.3)),  # no prior
+    }
+
+    expected = (
+        ls_prior.log_prob(jnp.array(0.7)).sum()
+        + mean_prior.log_prob(jnp.array(0.4)).sum()
+    )
+    assert jnp.allclose(collect_log_prior(tree), expected)
+
+
+def test_collect_log_prior_is_zero_without_priors():
+    from gpjax.parameters import PositiveReal, collect_log_prior
+
+    assert jnp.allclose(collect_log_prior({"a": PositiveReal(jnp.array(1.0))}), 0.0)
+
+
+def test_collect_log_prior_handles_vector_valued_parameters():
+    from gpjax.parameters import PositiveReal, collect_log_prior
+    import numpyro.distributions as dist
+
+    prior = dist.LogNormal(jnp.log(2.0), 0.5)
+    ls = jnp.array([0.5, 1.0, 2.0])
+    assert jnp.allclose(
+        collect_log_prior(PositiveReal(ls, prior=prior)), prior.log_prob(ls).sum()
+    )

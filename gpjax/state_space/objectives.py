@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import jax.numpy as jnp
-import paramax
 
+from gpjax.parameters import value
 from gpjax.state_space.inference import kalman_filter
 from gpjax.state_space.kernels import to_sde
 
@@ -18,11 +18,16 @@ def state_space_mll(
     """Marginal log-likelihood via the square-root Kalman filter.
 
     Internally:
-      1. Unwraps the posterior (resolving paramax-wrapped parameters).
-      2. Builds the SDE via ``to_sde(kernel)``.
-      3. Centres targets with ``y - mean_function(X)``.
-      4. Computes ``sigma_eff = sqrt(obs_stddev² + prior.jitter)``.
-      5. Delegates to ``kalman_filter``.
+      1. Builds the SDE via ``to_sde(kernel)``.
+      2. Centres targets with ``y - mean_function(X)``.
+      3. Computes ``sigma_eff = sqrt(obs_stddev² + prior.jitter)``.
+      4. Delegates to ``kalman_filter``.
+
+    Parameters are resolved where they are read, with
+    ``gpjax.parameters.value``, so the posterior may be passed either wrapped
+    (as ``fit`` supplies it, and as
+    :func:`gpjax.objectives.with_log_prior` requires) or already
+    resolved by ``paramax.unwrap``.
 
     Pure-JAX. **Assumes time-sorted input.** Unsorted times yield negative Δt and
     silently incorrect (NaN/garbage) results — there is no internal sort, because
@@ -52,7 +57,6 @@ def state_space_mll(
         >>> bool(jnp.isfinite(mll))
         True
     """
-    posterior = paramax.unwrap(posterior)
     prior = posterior.prior
     likelihood = posterior.likelihood
 
@@ -65,7 +69,7 @@ def state_space_mll(
     centred_targets = targets - mean_at_train
 
     sde = to_sde(prior.kernel)
-    obs_variance = likelihood.obs_stddev**2
+    obs_variance = value(likelihood.obs_stddev) ** 2
     sigma_eff = jnp.sqrt(obs_variance + prior.jitter)
 
     time_steps = jnp.concatenate([jnp.zeros(1), jnp.diff(times)])

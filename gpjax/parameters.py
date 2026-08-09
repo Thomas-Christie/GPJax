@@ -5,6 +5,7 @@ import jax
 from jax.nn import softplus
 import jax.numpy as jnp
 import jax.random as jr
+import numpyro.distributions as npd
 from numpyro.distributions import biject_to, constraints
 from numpyro.distributions.transforms import SoftplusLowerCholeskyTransform
 import paramax
@@ -55,12 +56,64 @@ class _DtypePreservingSoftplusLowerCholeskyTransform(SoftplusLowerCholeskyTransf
 _dtype_preserving_lower_cholesky = _DtypePreservingSoftplusLowerCholeskyTransform()
 
 
-def _val(x):
+def value(x):
     """Unwrap a paramax parameter or return the value directly."""
     return paramax.unwrap(x) if isinstance(x, AbstractUnwrappable) else x
 
 
-class PositiveReal(AbstractUnwrappable):
+# Internal alias, retained for the call sites throughout the library.
+_val = value
+
+
+class _OpaquePrior:
+    """Non-pytree holder for a prior distribution.
+
+    A numpyro ``Distribution`` is a pytree whose hyperparameters are usually
+    JAX arrays, and equinox warns -- rightly, in general -- when a JAX array is
+    placed in a static field. Holding the distribution in a plain object, which
+    is not registered as a pytree and so flattens to a single opaque leaf,
+    keeps those arrays invisible to that check and to ``eqx.partition``.
+    """
+
+    __slots__ = ("distribution",)
+
+    def __init__(self, distribution: npd.Distribution):
+        self.distribution = distribution
+
+    def __repr__(self) -> str:
+        return repr(self.distribution)
+
+
+class Parameter(AbstractUnwrappable):
+    """Base class for GPJax parameters, carrying an optional prior.
+
+    The prior is static rather than a pytree leaf: a numpyro ``Distribution``
+    is itself a pytree whose hyperparameters are arrays, so a dynamic field
+    would be swept into the trainable partition by ``eqx.partition(model,
+    eqx.is_array)`` -- the documented way to split a GPJax model -- and
+    silently optimised alongside the model. Priors compare by identity, so
+    rebuilding a model from scratch costs one ``jit`` retrace; within a single
+    fit the object is preserved by ``partition``/``combine``.
+
+    Attach one by passing ``prior=`` to any parameter and read it back from the
+    ``prior`` property::
+
+        PositiveReal(1.0, prior=numpyro.distributions.LogNormal(0.0, 1.0))
+
+    :func:`collect_log_prior` sums these over a model, and
+    :func:`gpjax.objectives.with_log_prior` turns that sum into
+    MAP-regularised fitting.
+    """
+
+    _prior: _OpaquePrior | None = eqx.field(static=True)
+
+    @property
+    def prior(self) -> npd.Distribution | None:
+        """The prior distribution attached to this parameter, if any."""
+        return None if self._prior is None else self._prior.distribution
+
+
+class PositiveReal(Parameter):
     """Strictly positive parameter.
 
     Stored unconstrained via the inverse of the softplus transform;
@@ -70,15 +123,16 @@ class PositiveReal(AbstractUnwrappable):
     _constraint = constraints.softplus_positive
     _unconstrained: jax.Array
 
-    def __init__(self, value):
+    def __init__(self, value, prior=None):
         transform = biject_to(self._constraint)
         self._unconstrained = transform.inv(jnp.asarray(value))
+        self._prior = None if prior is None else _OpaquePrior(prior)
 
     def unwrap(self):
         return biject_to(self._constraint)(self._unconstrained)
 
 
-class NonNegativeReal(AbstractUnwrappable):
+class NonNegativeReal(Parameter):
     """Non-negative parameter (semantically allows zero, e.g. jitter, noise floor).
 
     Uses the same softplus bijection as PositiveReal. The distinction is
@@ -88,40 +142,43 @@ class NonNegativeReal(AbstractUnwrappable):
     _constraint = constraints.softplus_positive
     _unconstrained: jax.Array
 
-    def __init__(self, value):
+    def __init__(self, value, prior=None):
         transform = biject_to(self._constraint)
         self._unconstrained = transform.inv(jnp.asarray(value))
+        self._prior = None if prior is None else _OpaquePrior(prior)
 
     def unwrap(self):
         return biject_to(self._constraint)(self._unconstrained)
 
 
-class Real(AbstractUnwrappable):
+class Real(Parameter):
     """Unconstrained parameter. unwrap() returns the value unchanged."""
 
     _constraint = constraints.real
     value: jax.Array
 
-    def __init__(self, value):
+    def __init__(self, value, prior=None):
         self.value = jnp.asarray(value)
+        self._prior = None if prior is None else _OpaquePrior(prior)
 
     def unwrap(self):
         return self.value
 
 
-class SigmoidBounded(AbstractUnwrappable):
+class SigmoidBounded(Parameter):
     """Parameter bounded to [low, high] via sigmoid bijection."""
 
     _unconstrained: jax.Array
     low: float = eqx.field(static=True)
     high: float = eqx.field(static=True)
 
-    def __init__(self, value, *, low=0.0, high=1.0):
+    def __init__(self, value, *, low=0.0, high=1.0, prior=None):
         value = jnp.asarray(value)
         transform = biject_to(constraints.interval(low, high))
         self._unconstrained = transform.inv(value)
         self.low = low
         self.high = high
+        self._prior = None if prior is None else _OpaquePrior(prior)
 
     @property
     def _constraint(self):
@@ -131,7 +188,7 @@ class SigmoidBounded(AbstractUnwrappable):
         return biject_to(self._constraint)(self._unconstrained)
 
 
-class LowerTriangular(AbstractUnwrappable):
+class LowerTriangular(Parameter):
     """Lower-triangular matrix parameter with positive diagonal (Cholesky factor).
 
     Stored as a flat vector; ``unwrap()`` fills a lower-triangular matrix
@@ -141,9 +198,10 @@ class LowerTriangular(AbstractUnwrappable):
     _constraint = constraints.softplus_lower_cholesky
     _flat: jax.Array
 
-    def __init__(self, value):
+    def __init__(self, value, prior=None):
         value = jnp.asarray(value)
         self._flat = _dtype_preserving_lower_cholesky.inv(value)
+        self._prior = None if prior is None else _OpaquePrior(prior)
 
     def unwrap(self):
         return _dtype_preserving_lower_cholesky(self._flat)
@@ -170,11 +228,48 @@ class CoregionalizationMatrix(eqx.Module):
         return w @ w.T + jnp.diag(k)
 
 
+def collect_log_prior(model) -> jax.Array:
+    r"""Sum the log-densities of every prior attached to a model's parameters.
+
+    Walks ``model`` for :class:`Parameter` leaves carrying a ``prior`` and
+    accumulates :math:`\sum_i \log p(\theta_i)`, evaluated at each parameter's
+    *constrained* value. Parameters without a prior contribute nothing.
+
+    Must be called on a model whose parameters are still wrapped --
+    ``paramax.unwrap`` replaces :class:`Parameter` leaves with bare arrays and
+    so discards the priors along with them.
+
+    Args:
+        model: Any pytree containing :class:`Parameter` leaves.
+
+    Returns:
+        Scalar total log-prior density; ``0.0`` when no parameter has a prior.
+    """
+    # Weakly typed, so that a model whose objective is float32 keeps a float32
+    # loss: jnp.zeros(()) is a *strong* float64 under jax_enable_x64 and would
+    # promote the sum, changing the dtype of the loss and of the scan carry.
+    total = jnp.asarray(0.0)
+
+    def is_param(leaf):
+        return isinstance(leaf, Parameter)
+
+    for leaf in jax.tree.leaves(model, is_leaf=is_param):
+        if is_param(leaf) and leaf.prior is not None:
+            # paramax.unwrap, not leaf.unwrap(): a frozen parameter holds a
+            # NonTrainable in place of its array, and only the recursive
+            # unwrap resolves it and preserves the gradient block.
+            total = total + jnp.sum(leaf.prior.log_prob(paramax.unwrap(leaf)))
+    return total
+
+
 __all__ = [
     "CoregionalizationMatrix",
     "LowerTriangular",
     "NonNegativeReal",
+    "Parameter",
     "PositiveReal",
     "Real",
     "SigmoidBounded",
+    "collect_log_prior",
+    "value",
 ]

@@ -22,7 +22,6 @@ from jax.flatten_util import ravel_pytree
 import jax.numpy as jnp
 import jax.random as jr
 import optax as ox
-import paramax
 from scipy.optimize import minimize
 
 from gpjax.dataset import Dataset
@@ -119,12 +118,11 @@ def fit(
 
     model = _prepare_model(model, train_data)
 
-    # Use paramax.unwrap for the constrained -> unconstrained -> constrained cycle.
-    # paramax handles the bijection automatically via AbstractUnwrappable subclasses.
-
-    # Loss definition -- paramax.unwrap resolves all AbstractUnwrappable leaves
+    # Loss definition. The model is passed with its parameters still wrapped:
+    # objectives resolve each one with gpjax.parameters.value as they read it,
+    # and wrappers such as objectives.with_log_prior need the Parameter
+    # leaves intact to find the priors attached to them.
     def loss(model: eqx.Module, batch: Dataset) -> ScalarFloat:
-        model = paramax.unwrap(model)
         return objective(model, batch)
 
     # Initialise optimiser state.
@@ -223,10 +221,9 @@ def fit_scipy(
     # Split model into trainable arrays and static parts
     params, static = eqx.partition(model, eqx.is_array)
 
-    # Loss definition
+    # Loss definition. The model keeps its parameters wrapped -- see `fit`.
     def loss(params) -> ScalarFloat:
         model = eqx.combine(params, static)
-        model = paramax.unwrap(model)
         return objective(model, train_data)
 
     # convert to numpy for interface with scipy
@@ -319,10 +316,9 @@ def fit_lbfgs(
     # Split model into trainable arrays and static parts
     params, static = eqx.partition(model, eqx.is_array)
 
-    # Loss definition
+    # Loss definition. The model keeps its parameters wrapped -- see `fit`.
     def loss(params) -> ScalarFloat:
         model = eqx.combine(params, static)
-        model = paramax.unwrap(model)
         return objective(model, train_data)
 
     # Initialise optimiser
@@ -552,8 +548,8 @@ def fit_natgrads(
     schedule = natgrad_lr if callable(natgrad_lr) else (lambda _: natgrad_lr)
 
     def hyper_loss(hyper, variational, batch):
-        model = paramax.unwrap(eqx.combine(variational, hyper))
-        return objective(model, batch)
+        # Parameters stay wrapped here too -- see `fit`.
+        return objective(eqx.combine(variational, hyper), batch)
 
     # Optimisation step.
     def step(carry, iteration_and_key):

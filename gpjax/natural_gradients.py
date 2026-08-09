@@ -742,7 +742,10 @@ def _variational_gaussian_step(
             family,
             (Real(trial_mean), LowerTriangular(trial_root_covariance)),
         )
-        return objective(paramax.unwrap(trial), data)
+        # `trial` is passed with its parameters still wrapped: objectives
+        # resolve each one as they read it, and unwrapping here would discard
+        # the Parameter leaves that `with_log_prior` reads priors from.
+        return objective(trial, data)
 
     loss_value, gradient = jax.value_and_grad(loss_of_expectation)(initial_expectation)
     # H_2 is symmetric, so the gradient must be read in the trace pairing on Sym(M).
@@ -875,12 +878,17 @@ def _dual_variational_gaussian_step(
     del map_jitter, backoff, max_backoff
     _reject_frozen_coordinates(variational)
 
-    family = paramax.unwrap(eqx.combine(variational, hyper))
+    # The objective is given the wrapped family -- it resolves parameters as it
+    # reads them, and needs the Parameter leaves intact for
+    # `with_log_prior`. The natural-gradient algebra below wants the
+    # resolved values, so keep both.
+    wrapped_family = eqx.combine(variational, hyper)
+    family = paramax.unwrap(wrapped_family)
 
     # One extra forward pass, taken deliberately: it makes `history[t]` the loss at the
     # pre-update parameters, exactly as in `fit` and in the Salimbeni branch. XLA
     # commonly common-subexpression-eliminates it against the `marginals` call below.
-    loss_value = objective(family, data)
+    loss_value = objective(wrapped_family, data)
 
     # Only the Cholesky of K_zz is needed for the target, which is built from
     # A = K_zz^{-1} K_zb; `_gram_and_root` therefore stops short of factorising R.

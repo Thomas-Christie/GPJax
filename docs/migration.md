@@ -349,9 +349,9 @@ diagonal was unconstrained). It is now parameterised via
 
 #### 4. `gpx.fit` / `fit_scipy` / `fit_lbfgs`: removed `params_bijection` and `trainable`
 
-Bijection handling is now automatic via `paramax.unwrap` inside the loss
-function, and freezing parameters is expressed by wrapping them in
-`paramax.non_trainable`:
+Bijection handling is now automatic — objectives resolve each parameter with
+`gpjax.parameters.value` as they read it — and freezing parameters is expressed
+by wrapping them in `paramax.non_trainable`:
 
 ```py
 # Before (0.13.x)
@@ -455,9 +455,10 @@ class MyParam(AbstractUnwrappable):
 
 - [ ] Replace `nnx.Module` base classes with `eqx.Module`, and add class-level
       type annotations for every field.
-- [ ] Replace `param.value` reads with `param.unwrap()`, or call
-      `paramax.unwrap(model)` once at the top of your loss / prediction
-      function.
+- [ ] Replace `param.value` reads with `gpjax.parameters.value(param)`. In a
+      custom objective the model arrives with its parameters wrapped, so read
+      each one through `value`; calling `paramax.unwrap(model)` up front also
+      works for prediction, but discards the priors attached to parameters.
 - [ ] Drop any `params_bijection=` / `trainable=` arguments passed to
       `gpx.fit`. To freeze parameters, wrap them with `paramax.non_trainable`
       using `eqx.tree_at`.

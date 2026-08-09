@@ -18,8 +18,11 @@ from gpjax.objectives import (
     with_log_prior,
 )
 from gpjax.parameters import (
+    NonNegativeReal,
     PositiveReal,
     _val,
+    collect_log_prior,
+    value,
 )
 from gpjax.variational_families import DualVariationalGaussian
 import jax
@@ -887,44 +890,127 @@ def test_pinned_elbo_is_a_lower_bound_on_the_evidence(family: str):
     assert elbo(q, data) <= conjugate_mll(q.model, data)
 
 
-def test_with_log_prior_matches_base_objective_when_prior_is_zero():
-    """A zero log-prior must leave both the value and the gradient of the
-    wrapped objective unchanged, i.e. `with_log_prior` does not disturb plain
-    `conjugate_mll` behaviour when no meaningful prior is supplied."""
+def test_with_log_prior_matches_base_objective_when_no_priors():
+    """With no priors attached, the wrapper must leave both the value and the
+    gradient of the wrapped objective unchanged, i.e. `with_log_prior`
+    does not disturb plain `conjugate_mll` behaviour."""
     key = jr.key(7)
     D = build_data(20, 1, key, binary=False)
 
     p = gpx.gps.Prior(
         kernel=gpx.kernels.RBF(), mean_function=gpx.mean_functions.Constant()
     )
-    likelihood = gpx.likelihoods.Gaussian()
-    posterior = p * likelihood
+    posterior = p * gpx.likelihoods.Gaussian()
 
-    zero_log_prior = lambda model: jnp.array(0.0)
-    regularised_mll = with_log_prior(conjugate_mll, zero_log_prior)
+    regularised_mll = with_log_prior(conjugate_mll)
 
-    base_value = conjugate_mll(posterior, D)
-    regularised_value = regularised_mll(posterior, D)
-    assert jnp.allclose(base_value, regularised_value)
+    assert jnp.equal(conjugate_mll(posterior, D), regularised_mll(posterior, D))
 
     params, static = eqx.partition(posterior, eqx.is_array)
 
     def base_loss(params):
-        model = paramax.unwrap(eqx.combine(params, static))
-        return -conjugate_mll(model, D)
+        return -conjugate_mll(eqx.combine(params, static), D)
 
     def regularised_loss(params):
-        model = paramax.unwrap(eqx.combine(params, static))
-        return -regularised_mll(model, D)
+        return -regularised_mll(eqx.combine(params, static), D)
 
-    base_grad = jax.grad(base_loss)(params)
-    regularised_grad = jax.grad(regularised_loss)(params)
     for base_leaf, regularised_leaf in zip(
-        jax.tree_util.tree_leaves(base_grad),
-        jax.tree_util.tree_leaves(regularised_grad),
+        jax.tree_util.tree_leaves(jax.grad(base_loss)(params)),
+        jax.tree_util.tree_leaves(jax.grad(regularised_loss)(params)),
         strict=True,
     ):
-        assert jnp.allclose(base_leaf, regularised_leaf)
+        assert jnp.equal(base_leaf, regularised_leaf)
+
+
+def test_with_log_prior_adds_exactly_the_summed_log_prior():
+    """The wrapper's value must equal the base objective plus the summed
+    log-densities of every attached prior, evaluated at the constrained
+    values."""
+    key = jr.key(11)
+    D = build_data(15, 1, key, binary=False)
+
+    ls_prior = dist.LogNormal(jnp.log(2.0), 0.5)
+    var_prior = dist.LogNormal(jnp.log(1.5), 0.3)
+    kernel = gpx.kernels.RBF(
+        lengthscale=PositiveReal(0.7, prior=ls_prior),
+        variance=PositiveReal(1.2, prior=var_prior),
+    )
+    posterior = (
+        gpx.gps.Prior(kernel=kernel, mean_function=gpx.mean_functions.Constant())
+        * gpx.likelihoods.Gaussian()
+    )
+
+    expected = (
+        conjugate_mll(posterior, D)
+        + ls_prior.log_prob(jnp.asarray(0.7)).sum()
+        + var_prior.log_prob(jnp.asarray(1.2)).sum()
+    )
+    assert jnp.equal(with_log_prior(conjugate_mll)(posterior, D), expected)
+    # collect_log_prior alone accounts for the whole difference.
+    assert jnp.equal(
+        collect_log_prior(posterior),
+        ls_prior.log_prob(jnp.asarray(0.7)).sum()
+        + var_prior.log_prob(jnp.asarray(1.2)).sum(),
+    )
+
+
+def test_with_log_prior_composes_with_a_hand_written_joint_prior():
+    """A prior over a derived quantity (signal-to-noise ratio) cannot live on a
+    single parameter, so it is written as a plain objective using `value`. Its
+    contribution must be additive with the per-parameter priors."""
+    key = jr.key(13)
+    D = build_data(15, 1, key, binary=False)
+
+    ls_prior = dist.LogNormal(jnp.log(2.0), 0.5)
+    snr_prior = dist.LogNormal(jnp.log(100.0), 1.0)
+
+    kernel = gpx.kernels.RBF(
+        lengthscale=PositiveReal(0.7, prior=ls_prior), variance=PositiveReal(1.2)
+    )
+    posterior = gpx.gps.Prior(
+        kernel=kernel, mean_function=gpx.mean_functions.Constant()
+    ) * gpx.likelihoods.Gaussian(obs_stddev=NonNegativeReal(0.3))
+
+    def snr_regularised_mll(model, data):
+        snr = (
+            value(model.prior.kernel.variance) / value(model.likelihood.obs_stddev) ** 2
+        )
+        return conjugate_mll(model, data) + snr_prior.log_prob(snr).sum()
+
+    combined = with_log_prior(snr_regularised_mll)
+    expected = (
+        conjugate_mll(posterior, D)
+        + snr_prior.log_prob(jnp.asarray(1.2) / jnp.asarray(0.3) ** 2).sum()
+        + ls_prior.log_prob(jnp.asarray(0.7)).sum()
+    )
+    assert jnp.allclose(combined(posterior, D), expected)
+
+
+def test_with_log_prior_respects_frozen_parameters():
+    """A prior on a parameter frozen with `paramax.non_trainable` must not
+    reintroduce a gradient for it."""
+    key = jr.key(17)
+    D = build_data(15, 1, key, binary=False)
+
+    kernel = gpx.kernels.RBF(
+        lengthscale=PositiveReal(0.7, prior=dist.LogNormal(jnp.log(5.0), 0.1))
+    )
+    posterior = (
+        gpx.gps.Prior(kernel=kernel, mean_function=gpx.mean_functions.Constant())
+        * gpx.likelihoods.Gaussian()
+    )
+    frozen = eqx.tree_at(
+        lambda m: m.prior.kernel.lengthscale,
+        posterior,
+        replace_fn=paramax.non_trainable,
+    )
+
+    params, static = eqx.partition(frozen, eqx.is_array)
+    grads = jax.grad(
+        lambda p: -with_log_prior(conjugate_mll)(eqx.combine(p, static), D)
+    )(params)
+    for leaf in jax.tree_util.tree_leaves(grads.prior.kernel.lengthscale):
+        assert jnp.equal(leaf, 0.0)
 
 
 def test_with_log_prior_map_regularised_fit_prefers_prior_consistent_lengthscale():
@@ -938,8 +1024,13 @@ def test_with_log_prior_map_regularised_fit_prefers_prior_consistent_lengthscale
     y = jnp.sin(2.0 * jnp.pi * 8.0 * X) + jr.normal(key, X.shape) * 0.05
     D = Dataset(X=X, y=y)
 
-    def build_posterior():
-        kernel = gpx.kernels.RBF(lengthscale=jnp.array(0.3), variance=jnp.array(1.0))
+    prior_mean = 3.0
+
+    def build_posterior(lengthscale_prior=None):
+        kernel = gpx.kernels.RBF(
+            lengthscale=PositiveReal(jnp.array(0.3), prior=lengthscale_prior),
+            variance=jnp.array(1.0),
+        )
         meanf = gpx.mean_functions.Constant()
         likelihood = gpx.likelihoods.Gaussian(obs_stddev=jnp.array(0.05))
         posterior = gpx.gps.Prior(mean_function=meanf, kernel=kernel) * likelihood
@@ -963,15 +1054,9 @@ def test_with_log_prior_map_regularised_fit_prefers_prior_consistent_lengthscale
         unregularised_model
     ).prior.kernel.lengthscale
 
-    prior_mean = 3.0
-
-    def log_prior(model):
-        lengthscale = model.prior.kernel.lengthscale
-        return dist.LogNormal(jnp.log(prior_mean), 0.15).log_prob(lengthscale).sum()
-
-    regularised_nmll = lambda p, d: -with_log_prior(conjugate_mll, log_prior)(p, d)
+    regularised_nmll = lambda p, d: -with_log_prior(conjugate_mll)(p, d)
     regularised_model, _ = gpx.fit_scipy(
-        model=build_posterior(),
+        model=build_posterior(dist.LogNormal(jnp.log(prior_mean), 0.15)),
         objective=regularised_nmll,
         train_data=D,
         verbose=False,
@@ -983,3 +1068,27 @@ def test_with_log_prior_map_regularised_fit_prefers_prior_consistent_lengthscale
     # The prior-regularised fit converges near the prior mean instead.
     assert jnp.abs(regularised_lengthscale - prior_mean) < 1.0
     assert regularised_lengthscale > unregularised_lengthscale
+
+
+@pytest.mark.parametrize(
+    ("objective_fn", "builder"),
+    [
+        (conjugate_mll, lambda: _pinned_setup(binary=False)[:2]),
+        (conjugate_loocv, lambda: _pinned_setup(binary=False)[:2]),
+        (elbo, lambda: _pinned_uncollapsed_family("unwhitened", binary=False)),
+        (elbo, lambda: _pinned_uncollapsed_family("whitened", binary=False)),
+    ],
+)
+def test_objectives_agree_on_wrapped_and_unwrapped_models(objective_fn, builder):
+    """Objectives resolve each parameter with `gpjax.parameters.value` as they
+    read it, so they must return the same value whether handed a model with its
+    parameters still wrapped -- which is what `fit` passes, and what
+    `with_log_prior` relies on -- or one already resolved by
+    `paramax.unwrap`."""
+    model, data = builder()
+    np.testing.assert_allclose(
+        np.float64(objective_fn(model, data)),
+        np.float64(objective_fn(paramax.unwrap(model), data)),
+        rtol=1e-12,
+        atol=0.0,
+    )

@@ -194,3 +194,52 @@ def test_state_space_mll_gradient_through_obs_stddev_is_finite():
     grad_value = jax.grad(loss)(jnp.asarray(0.2))
     assert jnp.isfinite(grad_value)
     assert grad_value != 0.0
+
+
+def test_state_space_mll_agrees_on_wrapped_and_unwrapped_models():
+    """`state_space_mll` resolves parameters with `gpjax.parameters.value` as it
+    reads them, so it must return the same value whether the posterior arrives
+    wrapped -- as `fit` supplies it, and as `with_log_prior` requires --
+    or already resolved by `paramax.unwrap`."""
+    import paramax
+
+    X = jnp.linspace(0.0, 5.0, 20).reshape(-1, 1)
+    train_data = gpx.Dataset(X=X, y=jnp.sin(X))
+    posterior = StateSpacePrior(
+        mean_function=gpx.mean_functions.Zero(),
+        kernel=gpx.kernels.Matern32(lengthscale=1.0, variance=1.0),
+    ) * gpx.likelihoods.Gaussian(obs_stddev=0.1)
+
+    np.testing.assert_allclose(
+        np.float64(state_space_mll(posterior, train_data)),
+        np.float64(state_space_mll(paramax.unwrap(posterior), train_data)),
+        rtol=1e-12,
+        atol=0.0,
+    )
+
+
+def test_state_space_mll_sees_parameter_priors():
+    """The objective must leave Parameter leaves intact for
+    `with_log_prior`, which reads the priors attached to them."""
+    from gpjax.objectives import with_log_prior
+    from gpjax.parameters import PositiveReal
+    import numpyro.distributions as dist
+
+    X = jnp.linspace(0.0, 5.0, 20).reshape(-1, 1)
+    train_data = gpx.Dataset(X=X, y=jnp.sin(X))
+    prior_dist = dist.LogNormal(0.0, 1.0)
+    posterior = StateSpacePrior(
+        mean_function=gpx.mean_functions.Zero(),
+        kernel=gpx.kernels.Matern32(
+            lengthscale=PositiveReal(1.0, prior=prior_dist), variance=1.0
+        ),
+    ) * gpx.likelihoods.Gaussian(obs_stddev=0.1)
+
+    base = state_space_mll(posterior, train_data)
+    regularised = with_log_prior(state_space_mll)(posterior, train_data)
+    np.testing.assert_allclose(
+        np.float64(regularised - base),
+        np.float64(prior_dist.log_prob(jnp.asarray(1.0)).sum()),
+        rtol=1e-10,
+        atol=0.0,
+    )

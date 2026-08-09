@@ -47,8 +47,10 @@ from gpjax.objectives import (
     conjugate_mll,
     dual_elbo,
     elbo,
+    with_log_prior,
 )
 from gpjax.parameters import (
+    Parameter,
     PositiveReal,
     _val,
 )
@@ -1304,3 +1306,82 @@ def test_fit_on_dual_family_still_works() -> None:
     assert history.shape == (20,)
     assert bool(jnp.all(jnp.isfinite(history)))
     assert history[-1] < history[0]
+
+
+def _has_visible_prior(model) -> bool:
+    """Whether any Parameter reaching the objective still carries its prior."""
+
+    def is_param(leaf):
+        return isinstance(leaf, Parameter)
+
+    return any(
+        is_param(leaf) and leaf.prior is not None
+        for leaf in jtu.tree_leaves(model, is_leaf=is_param)
+    )
+
+
+@pytest.mark.parametrize(
+    "fit_fn",
+    [
+        lambda **kw: fit(optim=ox.adam(0.01), num_iters=5, **kw),
+        lambda **kw: fit_scipy(max_iters=5, **kw),
+        lambda verbose, **kw: fit_lbfgs(max_iters=5, **kw),
+    ],
+    ids=["fit", "fit_scipy", "fit_lbfgs"],
+)
+def test_fit_passes_wrapped_parameters_so_priors_are_visible(fit_fn) -> None:
+    """Every fit entry point must hand the objective a model whose Parameter
+    leaves are intact. Unwrapping first would make `with_log_prior`
+    contribute zero silently, since `paramax.unwrap` discards the priors along
+    with the parameters carrying them."""
+    import numpyro.distributions as dist
+
+    X = jnp.linspace(0.0, 1.0, 20).reshape(-1, 1)
+    D = Dataset(X=X, y=jnp.sin(X))
+
+    seen = []
+
+    def objective(model, data):
+        seen.append(_has_visible_prior(model))
+        return -with_log_prior(conjugate_mll)(model, data)
+
+    kernel = RBF(lengthscale=PositiveReal(1.0, prior=dist.LogNormal(0.0, 1.0)))
+    posterior = Prior(kernel=kernel, mean_function=Constant()) * Gaussian()
+
+    fit_fn(model=posterior, objective=objective, train_data=D, verbose=False)
+
+    assert seen, "objective was never called"
+    assert all(seen)
+
+
+def test_fit_natgrads_passes_wrapped_parameters_so_priors_are_visible() -> None:
+    """Same contract for the natural-gradient path, which evaluates the
+    objective inside `natural_gradient_step` as well as in `hyper_loss`."""
+    import numpyro.distributions as dist
+
+    q, D = _svgp_setup(n_data=20)
+    q = eqx.tree_at(
+        lambda t: t.model.prior.kernel.lengthscale,
+        q,
+        PositiveReal(1.0, prior=dist.LogNormal(0.0, 1.0)),
+    )
+
+    seen = []
+
+    def objective(model, data):
+        seen.append(_has_visible_prior(model))
+        return -with_log_prior(elbo)(model, data)
+
+    fit_natgrads(
+        model=q,
+        objective=objective,
+        train_data=D,
+        optim=ox.adam(0.05),
+        natgrad_lr=0.5,
+        num_iters=3,
+        verbose=False,
+        key=jr.key(123),
+    )
+
+    assert seen, "objective was never called"
+    assert all(seen)
